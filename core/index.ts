@@ -191,7 +191,7 @@ class ReactAgentBuilder {
   }
 
   /**
-   * Initialize runtime configuration
+   * Initialize runtime configuration with support for separate reasoning and execution models
    */
   init(runtimeConfig: Record<string, any>) {
     this.runtimeConfig = runtimeConfig;
@@ -200,6 +200,9 @@ class ReactAgentBuilder {
       this.preferredProvider = runtimeConfig.selectedProvider;
     }
 
+    // Handle separate model configuration with validation and defaults
+    this.validateAndSetupSeparateModels(runtimeConfig);
+
     this.graph = null;
     this.compiledGraph = null;
 
@@ -207,20 +210,76 @@ class ReactAgentBuilder {
     return this;
   }
 
+  /**
+   * Validate and setup separate model configuration
+   */
+  private validateAndSetupSeparateModels(runtimeConfig: Record<string, any>) {
+    const hasReasonConfig = runtimeConfig.reasonProvider || runtimeConfig.reasonModel;
+    const hasExecutionConfig = runtimeConfig.selectedProvider || runtimeConfig.model;
+
+    // Set default models if not provided
+    if (hasReasonConfig && !runtimeConfig.reasonModel) {
+      runtimeConfig.reasonModel = "gpt-4o-mini";
+      console.warn("⚠️ reasonModel not specified, using default: gpt-4o-mini");
+    }
+    
+    if (hasExecutionConfig && !runtimeConfig.model) {
+      runtimeConfig.model = "gpt-4o-mini";
+      console.warn("⚠️ execution model not specified, using default: gpt-4o-mini");
+    }
+
+    // Validate provider configurations
+    if (
+      runtimeConfig.reasonProvider &&
+      !(
+        this.config[getProviderKey(runtimeConfig.reasonProvider)] ||
+        this.config['geminiKey']
+      )
+    ) {
+      console.warn(`⚠️ No API key configured for reasoning provider: ${runtimeConfig.reasonProvider}`);
+    }
+
+    if (
+      runtimeConfig.selectedProvider &&
+      !(
+        this.config[getProviderKey(runtimeConfig.selectedProvider)] ||
+        this.config['geminiKey']
+      )
+    ) {
+      console.warn(`⚠️ No API key configured for execution provider: ${runtimeConfig.selectedProvider}`);
+    }
+
+    // If separate models are configured, log the configuration
+    if (hasReasonConfig || hasExecutionConfig) {
+      console.log("🧠⚡ Separate model configuration:", {
+        reasoning: runtimeConfig.reasonProvider ? 
+          `${runtimeConfig.reasonProvider}/${runtimeConfig.reasonModel}` : 
+          "Using execution config",
+        execution: runtimeConfig.selectedProvider ? 
+          `${runtimeConfig.selectedProvider}/${runtimeConfig.model}` : 
+          "Using reasoning config"
+      });
+    }
+  }
+
   buildGraph() {
     if (!this.graph) {
       // Choose action node based on configuration
       const actionNode = this.config.useSubgraph ? this.actionSubgraph.execute : ActionAgent.execute;
-      // Graph setup - Using static methods for cleaner architecture
+      
+      // Create agent wrappers that apply appropriate model configuration
+      const wrappedAgents = this.createAgentWrappers();
+      
+      // Graph setup - Using wrapped agents for separate model support
       this.graph = new StateGraph({ channels: AgentStateChannels });
       if (this.config.useEnhancedPrompt) {
-        this.graph.addNode("enhancePrompt", EnhancePromptAgent.execute);
+        this.graph.addNode("enhancePrompt", wrappedAgents.enhancePrompt);
       }
       this.graph
-          .addNode("taskBreakdown", TaskBreakdownAgent.execute)
-          .addNode("taskReplanning", TaskReplanningAgent.execute)
-          .addNode("action", actionNode) // Dynamic node selection
-          .addNode("completion", CompletionAgent.execute);
+          .addNode("taskBreakdown", wrappedAgents.taskBreakdown)
+          .addNode("taskReplanning", wrappedAgents.taskReplanning)
+          .addNode("action", wrappedAgents.action) // Dynamic node selection with wrapper
+          .addNode("completion", wrappedAgents.completion);
 
       if (this.config.useEnhancedPrompt) {
         this.graph
@@ -239,6 +298,99 @@ class ReactAgentBuilder {
       this.compiledGraph = this.graph.compile();
     }
     return this;
+  }
+
+  /**
+   * Create agent wrappers that apply appropriate model configuration based on agent type
+   */
+  private createAgentWrappers() {
+    const hasReasonConfig = this.runtimeConfig.reasonProvider || this.runtimeConfig.reasonModel;
+    const hasExecutionConfig = this.runtimeConfig.selectedProvider || this.runtimeConfig.model;
+
+    // If no separate configuration, use original agents
+    if (!hasReasonConfig && !hasExecutionConfig) {
+      const actionNode = this.config.useSubgraph ? this.actionSubgraph.execute : ActionAgent.execute;
+      return {
+        enhancePrompt: EnhancePromptAgent.execute,
+        taskBreakdown: TaskBreakdownAgent.execute,
+        taskReplanning: TaskReplanningAgent.execute,
+        action: actionNode,
+        completion: CompletionAgent.execute,
+      };
+    }
+
+    // Create wrapped agents with appropriate model configuration
+    const reasoningConfig = this.createReasoningConfig();
+    const executionConfig = this.createExecutionConfig();
+
+    return {
+      enhancePrompt: this.wrapReasoningAgent(EnhancePromptAgent.execute, reasoningConfig),
+      taskBreakdown: this.wrapReasoningAgent(TaskBreakdownAgent.execute, reasoningConfig),
+      taskReplanning: this.wrapReasoningAgent(TaskReplanningAgent.execute, reasoningConfig),
+      action: this.wrapExecutionAgent(
+        this.config.useSubgraph ? this.actionSubgraph.execute : ActionAgent.execute, 
+        executionConfig
+      ),
+      completion: this.wrapExecutionAgent(CompletionAgent.execute, executionConfig),
+    };
+  }
+
+  /**
+   * Create reasoning configuration for reasoning agents
+   */
+  private createReasoningConfig() {
+    return {
+      selectedProvider: this.runtimeConfig.reasonProvider || this.runtimeConfig.selectedProvider || this.preferredProvider,
+      model: this.runtimeConfig.reasonModel || this.runtimeConfig.model || "gpt-4o-mini",
+    };
+  }
+
+  /**
+   * Create execution configuration for execution agents
+   */
+  private createExecutionConfig() {
+    return {
+      selectedProvider: this.runtimeConfig.selectedProvider || this.runtimeConfig.reasonProvider || this.preferredProvider,
+      model: this.runtimeConfig.model || this.runtimeConfig.reasonModel || "gpt-4o-mini",
+    };
+  }
+
+  /**
+   * Wrap a reasoning agent to apply reasoning model configuration
+   */
+  private wrapReasoningAgent(originalAgent: any, reasoningConfig: any) {
+    return async (input: unknown, config: Record<string, any>) => {
+      const mergedConfig = {
+        ...config,
+        configurable: {
+          ...config.configurable,
+          ...reasoningConfig,
+          selectedKey: this.config[
+            (getProviderKey(reasoningConfig.selectedProvider as LlmProvider) as 'geminiKey' | 'openaiKey' | 'openrouterKey' | undefined) ?? 'geminiKey'
+          ],
+        }
+      };
+      return originalAgent(input, mergedConfig);
+    };
+  }
+
+  /**
+   * Wrap an execution agent to apply execution model configuration
+   */
+  private wrapExecutionAgent(originalAgent: any, executionConfig: any) {
+    return async (input: unknown, config: Record<string, any>) => {
+      const mergedConfig = {
+        ...config,
+        configurable: {
+          ...config.configurable,
+          ...executionConfig,
+          selectedKey: this.config[
+            (getProviderKey(executionConfig.selectedProvider as LlmProvider) as 'geminiKey' | 'openaiKey' | 'openrouterKey' | undefined) ?? 'geminiKey'
+          ],
+        }
+      };
+      return originalAgent(input, mergedConfig);
+    };
   }
 
   /**
